@@ -45,6 +45,7 @@ from givemeasign.telegram.cards import (
     format_decision_footer,
     parse_callback_data,
 )
+from givemeasign.telegram.settings import get_display_locale
 from givemeasign.telegram.sender import _today_in_tz, send_deck
 from givemeasign.telegram.settings import (
     get_daily_deck_schedule,
@@ -230,7 +231,7 @@ async def cb_verdict(query: CallbackQuery) -> None:
         original_html = query.message.html_text or query.message.text or ""
     except Exception:
         original_html = ""
-    new_text = original_html + format_decision_footer(verdict)
+    new_text = original_html + format_decision_footer(verdict, locale=get_display_locale())
     try:
         await query.message.edit_text(
             text=new_text,

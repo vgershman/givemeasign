@@ -1,7 +1,13 @@
-"""Render a research_pack and deliver it to Telegram in <=4096-char chunks."""
+"""Render a research_pack and deliver it to Telegram in <=4096-char chunks.
+
+Supports locale-aware rendering: when bot_settings.display_locale is non-English,
+the pack's content_json is translated once via Haiku and cached on the pack row;
+static labels (TL;DR, Market context, etc.) come from the i18n locale bundle.
+"""
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from html import escape
 from uuid import UUID
@@ -13,7 +19,11 @@ from aiogram.exceptions import TelegramAPIError
 from givemeasign.config import settings
 from givemeasign.db.models import Candidate, ResearchPack
 from givemeasign.db.session import session_scope
+from givemeasign.i18n.strings import label
+from givemeasign.i18n.translator import ensure_research_translation
+from givemeasign.llm.router import LLMRouter
 from givemeasign.observability.logging import logger
+from givemeasign.telegram.settings import get_display_locale
 
 TELEGRAM_MAX = 4096
 _SOFT_MAX = 3800  # headroom for split safety
@@ -42,7 +52,14 @@ def _severity_icon(severity: str | None) -> str:
     )
 
 
-def _header_section(candidate: Candidate, pack: ResearchPack, content: dict) -> str:
+def _header_section(
+    candidate: Candidate,
+    pack: ResearchPack,
+    content: dict,
+    concept_display: str,
+    *,
+    locale: str,
+) -> str:
     tldr = _h(content.get("tldr") or pack.summary or "")
     rec = (content.get("recommendation") or pack.recommendation or "").lower()
     rec_icon = _RECOMMENDATION_ICON.get(rec, "⚪")
@@ -53,15 +70,16 @@ def _header_section(candidate: Candidate, pack: ResearchPack, content: dict) -> 
         "%Y-%m-%d %H:%M UTC"
     )
     return (
-        f"🔬 <b>Deep research</b>\n"
-        f"<b>{_h(candidate.concept)}</b>\n"
-        f"score {agg_str} · generated {ts}\n\n"
-        f"<b>TL;DR</b>\n{tldr}\n\n"
-        f"{rec_icon} <b>Recommendation:</b> {_h(rec.upper() or '—')} — {rec_reason}"
+        f"🔬 <b>{label('research_header', locale)}</b>\n"
+        f"<b>{_h(concept_display)}</b>\n"
+        f"{label('card_score', locale)} {agg_str} · {label('research_generated_at', locale)} {ts}\n\n"
+        f"<b>{label('research_tldr', locale)}</b>\n{tldr}\n\n"
+        f"{rec_icon} <b>{label('research_recommendation', locale)}:</b> "
+        f"{_h(rec.upper() or '—')} — {rec_reason}"
     )
 
 
-def _market_section(content: dict) -> str:
+def _market_section(content: dict, *, locale: str) -> str:
     ctx = _h(content.get("market_context") or "")
     incumbents = content.get("incumbents") or []
     inc_lines = []
@@ -71,27 +89,33 @@ def _market_section(content: dict) -> str:
         gaps = _h(inc.get("gaps") or "")
         url = inc.get("url")
         name_html = (
-            f'<a href="{_h(url)}">{name}</a>' if url and str(url).startswith("http") else f"<b>{name}</b>"
+            f'<a href="{_h(url)}">{name}</a>'
+            if url and str(url).startswith("http")
+            else f"<b>{name}</b>"
         )
         inc_lines.append(f"• {name_html}\n  ✅ {strengths}\n  ❌ {gaps}")
-    incs_block = "\n\n".join(inc_lines) if inc_lines else "(none listed)"
+    incs_block = (
+        "\n\n".join(inc_lines)
+        if inc_lines
+        else label("research_none_listed", locale)
+    )
     wedge = _h(content.get("differentiation_wedge") or "")
     return (
-        f"<b>Market context</b>\n{ctx}\n\n"
-        f"<b>Incumbents</b>\n{incs_block}\n\n"
-        f"<b>Differentiation wedge</b>\n{wedge}"
+        f"<b>{label('research_market_context', locale)}</b>\n{ctx}\n\n"
+        f"<b>{label('research_incumbents', locale)}</b>\n{incs_block}\n\n"
+        f"<b>{label('research_wedge', locale)}</b>\n{wedge}"
     )
 
 
-def _plan_section(content: dict) -> str:
+def _plan_section(content: dict, *, locale: str) -> str:
     plan = content.get("build_plan_90d") or []
     plan_lines = []
     for row in plan[:6]:
         weeks = _h(row.get("weeks") or "?")
         focus = _h(row.get("focus") or "")
         deliv = _h(row.get("deliverable") or "")
-        plan_lines.append(f"• <b>Weeks {weeks}</b>: {focus}\n  → {deliv}")
-    plan_block = "\n".join(plan_lines) if plan_lines else "(no plan)"
+        plan_lines.append(f"• <b>{weeks}</b>: {focus}\n  → {deliv}")
+    plan_block = "\n".join(plan_lines) if plan_lines else label("research_no_plan", locale)
 
     models = content.get("monetization_models") or []
     mon_lines = []
@@ -100,15 +124,15 @@ def _plan_section(content: dict) -> str:
         price = _h(m.get("price_range") or "")
         reason = _h(m.get("reasoning") or "")
         mon_lines.append(f"• <b>{model_type}</b> ({price}): {reason}")
-    mon_block = "\n".join(mon_lines) if mon_lines else "(none suggested)"
+    mon_block = "\n".join(mon_lines) if mon_lines else label("research_none_suggested", locale)
 
     return (
-        f"<b>90-day build plan</b>\n{plan_block}\n\n"
-        f"<b>Monetization</b>\n{mon_block}"
+        f"<b>{label('research_build_plan', locale)}</b>\n{plan_block}\n\n"
+        f"<b>{label('research_monetization', locale)}</b>\n{mon_block}"
     )
 
 
-def _channels_risks_section(content: dict) -> str:
+def _channels_risks_section(content: dict, *, locale: str) -> str:
     channels = content.get("traffic_channels") or []
     ch_lines = []
     for ch in channels[:6]:
@@ -116,7 +140,7 @@ def _channels_risks_section(content: dict) -> str:
         rationale = _h(ch.get("rationale") or "")
         effort = _effort_icon(ch.get("effort"))
         ch_lines.append(f"• {effort} <b>{channel}</b>: {rationale}")
-    ch_block = "\n".join(ch_lines) if ch_lines else "(none)"
+    ch_block = "\n".join(ch_lines) if ch_lines else label("research_none", locale)
 
     risks = content.get("risks") or []
     risk_lines = []
@@ -125,27 +149,35 @@ def _channels_risks_section(content: dict) -> str:
         risk = _h(r.get("risk") or "")
         mit = _h(r.get("mitigation") or "")
         risk_lines.append(f"• {sev} {risk}\n   ↳ {mit}")
-    risk_block = "\n\n".join(risk_lines) if risk_lines else "(none)"
+    risk_block = "\n\n".join(risk_lines) if risk_lines else label("research_none", locale)
 
     tam = _h(content.get("tam_sanity") or "")
     first_test = _h(content.get("first_validation_test") or "")
 
     return (
-        f"<b>Traffic channels</b>\n{ch_block}\n\n"
-        f"<b>Risks</b>\n{risk_block}\n\n"
-        f"<b>TAM sanity</b>\n{tam}\n\n"
-        f"🎯 <b>First validation test (this week)</b>\n{first_test}"
+        f"<b>{label('research_traffic', locale)}</b>\n{ch_block}\n\n"
+        f"<b>{label('research_risks', locale)}</b>\n{risk_block}\n\n"
+        f"<b>{label('research_tam', locale)}</b>\n{tam}\n\n"
+        f"🎯 <b>{label('research_first_test', locale)}</b>\n{first_test}"
     )
 
 
-def build_message_chunks(candidate: Candidate, pack: ResearchPack) -> list[str]:
+def build_message_chunks(
+    candidate: Candidate,
+    pack: ResearchPack,
+    *,
+    content: dict | None = None,
+    concept_display: str | None = None,
+    locale: str = "en",
+) -> list[str]:
     """Return 3–4 Telegram HTML chunks, each under Telegram's size limit."""
-    content = pack.content_json or {}
+    actual_content = content if content is not None else (pack.content_json or {})
+    concept_shown = concept_display or candidate.concept or ""
     sections = [
-        _header_section(candidate, pack, content),
-        _market_section(content),
-        _plan_section(content),
-        _channels_risks_section(content),
+        _header_section(candidate, pack, actual_content, concept_shown, locale=locale),
+        _market_section(actual_content, locale=locale),
+        _plan_section(actual_content, locale=locale),
+        _channels_risks_section(actual_content, locale=locale),
     ]
     # Enforce hard cap defensively — split oversized sections at blank lines.
     out: list[str] = []
@@ -194,8 +226,10 @@ async def deliver_pack(
         bot = Bot(token=token)
         own_bot = True
 
+    locale = get_display_locale()
+
     try:
-        # Load pack + candidate inside one session; detach for async send.
+        # Load pack + candidate inside one session; detach for async work.
         with session_scope() as s:
             pack = s.get(ResearchPack, pack_id)
             if pack is None:
@@ -213,14 +247,49 @@ async def deliver_pack(
                 )
                 return False
             _ = pack.content_json  # force-load before expunge
+            _ = pack.translations
+            _ = candidate.translations
             s.expunge(pack)
             s.expunge(candidate)
 
-        chunks = build_message_chunks(candidate, pack)
-        logger.info(
-            f"deliver_pack: sending {len(chunks)} chunk(s) for {pack.candidate_id}"
+        # Resolve content + concept in the chosen locale.
+        content = pack.content_json or {}
+        concept_display = candidate.concept or ""
+        if locale != "en":
+            router = LLMRouter()
+            try:
+                translated_pack = await ensure_research_translation(
+                    pack_id, locale, router
+                )
+                if translated_pack:
+                    content = translated_pack
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    f"deliver_pack: pack translation failed, using English: {e}"
+                )
+            try:
+                from givemeasign.i18n.translator import ensure_candidate_translation
+
+                translated_cand = await ensure_candidate_translation(
+                    candidate.id, locale, router
+                )
+                if translated_cand and translated_cand.get("concept"):
+                    concept_display = translated_cand["concept"]
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    f"deliver_pack: concept translation failed, using English: {e}"
+                )
+
+        chunks = build_message_chunks(
+            candidate,
+            pack,
+            content=content,
+            concept_display=concept_display,
+            locale=locale,
         )
-        import asyncio
+        logger.info(
+            f"deliver_pack: sending {len(chunks)} chunk(s) for {pack.candidate_id} locale={locale}"
+        )
 
         for chunk in chunks:
             try:

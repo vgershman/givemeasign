@@ -37,6 +37,8 @@ def _read_fresh() -> dict:
                 "daily_deck_hour": 23,
                 "daily_deck_minute": 0,
                 "daily_deck_enabled": True,
+                "trends_enabled": False,
+                "display_locale": "en",
             }
         return {
             "telegram_log_enabled": row.telegram_log_enabled,
@@ -44,6 +46,8 @@ def _read_fresh() -> dict:
             "daily_deck_hour": row.daily_deck_hour,
             "daily_deck_minute": row.daily_deck_minute,
             "daily_deck_enabled": row.daily_deck_enabled,
+            "trends_enabled": row.trends_enabled,
+            "display_locale": row.display_locale,
         }
 
 
@@ -92,6 +96,39 @@ def set_telegram_log(*, enabled: bool, min_level: str | None = None) -> None:
             if min_level:
                 row.telegram_log_min_level = min_level.upper()
     _cache = None  # force next read to refresh
+
+
+def is_trends_enabled() -> bool:
+    return bool(get_settings().get("trends_enabled", False))
+
+
+def get_display_locale() -> str:
+    return str(get_settings().get("display_locale", "en")).lower()
+
+
+def set_display_locale(locale: str) -> None:
+    global _cache
+    locale = (locale or "en").lower()
+    with session_scope() as s:
+        row = s.get(BotSettings, 1)
+        if row is None:
+            row = BotSettings(id=1, display_locale=locale)
+            s.add(row)
+        else:
+            row.display_locale = locale
+    _cache = None
+
+
+def set_trends_enabled(enabled: bool) -> None:
+    global _cache
+    with session_scope() as s:
+        row = s.get(BotSettings, 1)
+        if row is None:
+            row = BotSettings(id=1, trends_enabled=enabled)
+            s.add(row)
+        else:
+            row.trends_enabled = enabled
+    _cache = None
 
 
 def set_daily_deck_schedule(

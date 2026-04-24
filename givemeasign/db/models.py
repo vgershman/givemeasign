@@ -124,6 +124,11 @@ class Candidate(Base, UUIDPrimaryKey, TimestampMixin):
     )
     scored_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
+    # Lazy-populated translations keyed by locale code (e.g. {"ru": {...}}).
+    # English stays in concept/target_user/value_prop/angles; non-English
+    # rendering uses translations[locale].
+    translations: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+
     def __repr__(self) -> str:
         return f"<Candidate {self.status} agg={self.aggregate_score} {self.concept[:50]!r}>"
 
@@ -237,6 +242,14 @@ class BotSettings(Base):
     daily_deck_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True
     )
+    # Off by default: pytrends gets rate-limited from datacenter IPs and
+    # contributes little signal on niche B2B queries. Flip on when useful.
+    trends_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+    # Telegram output language. DB content stays English; this toggles lazy
+    # translation of cards + research packs at delivery time.
+    display_locale: Mapped[str] = mapped_column(String(5), nullable=False, default="en")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -287,6 +300,9 @@ class ResearchPack(Base, UUIDPrimaryKey, TimestampMixin):
     generated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     sent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     error_message: Mapped[str | None] = mapped_column(Text)
+
+    # Lazy-populated translations of content_json by locale code.
+    translations: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
 
 
 class TrendCache(Base, UUIDPrimaryKey):

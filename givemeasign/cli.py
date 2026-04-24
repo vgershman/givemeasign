@@ -527,6 +527,64 @@ def send_deck_cmd(
         logger.info(f"Sent {result.sent} card(s).")
 
 
+@app.command("locale")
+def locale_cmd(
+    action: str = typer.Argument(
+        ..., help="ru | en | status (or any supported locale code)"
+    ),
+) -> None:
+    """Set the Telegram display locale. Cards + research packs are translated
+    lazily at delivery time and cached per entity."""
+    from givemeasign.i18n.strings import supported_locales
+    from givemeasign.telegram.settings import (
+        get_display_locale,
+        set_display_locale,
+    )
+
+    action = action.lower().strip()
+    if action == "status":
+        logger.info(f"Display locale: {get_display_locale()}")
+        return
+    if action not in supported_locales():
+        logger.error(
+            f"unsupported locale {action!r}; supported: {', '.join(supported_locales())}"
+        )
+        raise typer.Exit(code=2)
+    set_display_locale(action)
+    logger.info(f"Display locale set: {action}")
+
+
+@app.command("trends")
+def trends_cmd(
+    action: str = typer.Argument(..., help="on | off | status"),
+) -> None:
+    """Toggle Google Trends enrichment during scoring.
+
+    Off by default on VPS: pytrends gets rate-limited from datacenter IPs and
+    contributes little signal on niche B2B queries. Flip on if you're running
+    from a residential IP or when candidates lean consumer-product (where
+    Trends actually has search volume).
+    """
+    from givemeasign.telegram.settings import (
+        is_trends_enabled,
+        set_trends_enabled,
+    )
+
+    action = action.lower().strip()
+    if action == "on":
+        set_trends_enabled(True)
+        logger.info("Trends enrichment: ON")
+    elif action == "off":
+        set_trends_enabled(False)
+        logger.info("Trends enrichment: OFF")
+    elif action == "status":
+        state = "ON" if is_trends_enabled() else "OFF"
+        logger.info(f"Trends enrichment: {state}")
+    else:
+        logger.error(f"unknown action {action!r}; use one of: on | off | status")
+        raise typer.Exit(code=2)
+
+
 @app.command("telegram-log")
 def telegram_log_cmd(
     action: str = typer.Argument(..., help="on | off | status"),

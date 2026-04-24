@@ -17,9 +17,13 @@ from sqlalchemy.orm import Session
 from givemeasign.config import settings
 from givemeasign.db.models import Candidate, Score, SwipeVerdict
 from givemeasign.db.session import session_scope
+from givemeasign.i18n.strings import label
+from givemeasign.i18n.translator import ensure_candidate_translation
 from givemeasign.llm.prompts.score_candidate import SCORER_VERSION
+from givemeasign.llm.router import LLMRouter
 from givemeasign.observability.logging import logger
 from givemeasign.telegram.cards import format_card_html, make_keyboard
+from givemeasign.telegram.settings import get_display_locale
 
 
 @dataclass
@@ -112,6 +116,9 @@ async def send_deck(
                 ) from e
             raise
 
+        locale = get_display_locale()
+        router = LLMRouter() if locale != "en" else None
+
         # Pick + materialize candidates within a session, then release before async sends.
         with session_scope() as s:
             candidates = _fetch_deck_candidates(s, target_user, limit)
@@ -120,29 +127,58 @@ async def send_deck(
                 try:
                     await bot.send_message(
                         chat_id=target_user,
-                        text="No new candidates today. Pipeline will refill overnight.",
+                        text=label("no_new_candidates", locale),
                     )
                 except TelegramAPIError as e:
                     logger.warning(f"send_deck: telegram error on empty notice: {e}")
                 return DeckResult(sent=0, no_new=True)
 
-            cards = []
-            for rank, c in enumerate(candidates, start=1):
+            # Materialize candidate ids + scores (detach so we can await outside the session).
+            staged: list[tuple[Candidate, list[Score]]] = []
+            for c in candidates:
                 scores = _fetch_scores(s, c.id)
-                cards.append(
-                    {
-                        "candidate_id": str(c.id),
-                        "html": format_card_html(c, scores, rank=rank, total=len(candidates)),
-                    }
-                )
-            logger.info(f"send_deck: sending {len(cards)} card(s) to user_id={target_user}")
+                for sc in scores:
+                    s.expunge(sc)
+                s.expunge(c)
+                staged.append((c, scores))
+            logger.info(
+                f"send_deck: sending {len(staged)} card(s) to user_id={target_user} locale={locale}"
+            )
 
-        # Send a header message first so the user knows a fresh deck arrived.
+        # Build card payloads. If non-English locale, translate each card lazily.
+        cards = []
+        for rank, (c, scores) in enumerate(staged, start=1):
+            translated: dict | None = None
+            if router is not None:
+                try:
+                    translated = await ensure_candidate_translation(c.id, locale, router)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(
+                        f"send_deck: translation failed for {c.id}, falling back to English: {e}"
+                    )
+                    translated = None
+            cards.append(
+                {
+                    "candidate_id": str(c.id),
+                    "html": format_card_html(
+                        c,
+                        scores,
+                        rank=rank,
+                        total=len(staged),
+                        locale=locale,
+                        translated=translated,
+                    ),
+                }
+            )
+
+        # Header message.
+        header = (
+            f"🎴 <b>{label('deck_header', locale)}</b> — "
+            f"{today.isoformat()} · {len(cards)} {label('candidates_suffix', locale)}"
+        )
         try:
             await bot.send_message(
-                chat_id=target_user,
-                text=f"🎴 <b>Daily deck</b> — {today.isoformat()} · {len(cards)} candidate(s)",
-                parse_mode=ParseMode.HTML,
+                chat_id=target_user, text=header, parse_mode=ParseMode.HTML
             )
         except TelegramAPIError as e:
             logger.warning(f"send_deck: header send failed: {e}")
@@ -154,7 +190,7 @@ async def send_deck(
                     chat_id=target_user,
                     text=card["html"],
                     parse_mode=ParseMode.HTML,
-                    reply_markup=make_keyboard(card["candidate_id"]),
+                    reply_markup=make_keyboard(card["candidate_id"], locale=locale),
                     disable_web_page_preview=True,
                 )
                 sent += 1

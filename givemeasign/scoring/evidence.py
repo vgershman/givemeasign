@@ -193,15 +193,25 @@ _TREND_NO_SIGNAL_HIGH = 0.60
 async def enrich_with_trends(evidence: Evidence, router: LLMRouter) -> None:
     """Populate `evidence.trend_slopes` via keyword derivation + pytrends.
 
-    Always safe to call. Every failure mode (LLM down, pytrends blocked,
-    empty trend data) results in an empty `trend_slopes` dict and a warning
-    log. The scoring prompt renders "Google Trends: (unavailable)" in that
-    case — scoring continues normally.
+    Gated by the `trends_enabled` flag in bot_settings (default OFF). When off,
+    this function is a no-op and skips the keyword-derivation Haiku call too —
+    zero cost when disabled. Toggle with `givemeasign trends on|off`.
 
-    Slopes in the 0.40–0.60 "noise floor" band are dropped: on low-volume
-    niche queries pytrends returns essentially-flat series and those slopes
-    are not real signal.
+    When on, every failure mode (LLM down, pytrends blocked, empty data)
+    still results in an empty `trend_slopes` dict and a warning log. The
+    scoring prompt renders "Google Trends: (unavailable)" in that case.
+
+    Slopes in the 0.40–0.60 "noise floor" band are dropped even when
+    fetching succeeds: on low-volume niche queries pytrends returns
+    essentially-flat series and those slopes aren't real signal.
     """
+    # Lazy import to avoid circular settings ↔ bot_settings dependency if ever refactored.
+    from givemeasign.telegram.settings import is_trends_enabled
+
+    if not is_trends_enabled():
+        # Silent no-op; scoring prompt will see an empty dict and handle it.
+        return
+
     try:
         keywords = await derive_keywords(evidence.candidate, router)
         if not keywords:
