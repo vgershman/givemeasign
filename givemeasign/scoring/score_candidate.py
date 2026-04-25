@@ -100,6 +100,7 @@ async def score_candidate(
         avg_strength=evidence.stats.avg_strength,
         demand_baseline=evidence.stats.demand_baseline,
         trend_slopes=evidence.trend_slopes or None,
+        is_hypothesis=(getattr(c, "origin", "pains") == "hypothesis"),
     )
     response = await router.chat(
         tier=tier,

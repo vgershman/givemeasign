@@ -17,6 +17,7 @@ from givemeasign.scoring.aggregate import multiplicative_aggregate
 from givemeasign.scoring.dedup import deduplicate_scored_candidates
 from givemeasign.scoring.evidence import build_evidence, enrich_with_trends
 from givemeasign.scoring.gates import evaluate_gates
+from givemeasign.scoring.learner import retrain_and_persist
 from givemeasign.scoring.score_candidate import score_candidate
 
 
@@ -49,6 +50,28 @@ async def score_candidates_batch(
     Old Score rows stay in the table for audit across versions.
     """
     router = LLMRouter()
+
+    # M7: retrain per-dimension weights from swipe history before scoring.
+    # Cheap (pure Python math). On insufficient swipes, returns uniform
+    # (None from load_current_weights), which aggregate treats as equal.
+    learned = retrain_and_persist()
+    if learned.is_learned:
+        logger.info(
+            f"weights: learned from {learned.pos_count} pos / "
+            f"{learned.neg_count} neg swipes (confidence={learned.confidence:.2f})"
+        )
+        # Log the three most-shifted dimensions for visibility.
+        shifted = sorted(
+            ((d, learned.weights[d]) for d in learned.weights),
+            key=lambda kv: abs(kv[1] - 1.0),
+            reverse=True,
+        )[:3]
+        for d, w in shifted:
+            delta = w - 1.0
+            logger.info(f"  {d:<15} weight={w:.3f}  (Δ{delta:+.3f})")
+        weights_for_aggregate: dict[str, float] | None = learned.weights
+    else:
+        weights_for_aggregate = None
 
     with session_scope() as s:
         if force:
@@ -198,7 +221,9 @@ async def score_candidates_batch(
                         f"  ✗ GATED ({gate_fired.name}): {gate_fired.description}"
                     )
                 else:
-                    agg = multiplicative_aggregate(result.values)
+                    agg = multiplicative_aggregate(
+                        result.values, weights=weights_for_aggregate
+                    )
                     s.execute(
                         update(Candidate)
                         .where(Candidate.id == cid)

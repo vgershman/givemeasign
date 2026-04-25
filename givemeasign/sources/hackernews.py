@@ -50,6 +50,27 @@ class HackerNewsSource(Source):
         r.raise_for_status()
         return r.json()
 
+    async def _search_by_query(
+        self,
+        *,
+        query: str,
+        tags: str,
+        limit: int,
+        since_days: int | None,
+    ) -> list[dict]:
+        """Hit /search (relevance-ranked) with a free-text query."""
+        params: dict[str, str | int] = {
+            "query": query,
+            "tags": tags,
+            "hitsPerPage": min(limit, 100),
+        }
+        if since_days is not None:
+            since = int(time.time()) - since_days * 86_400
+            params["numericFilters"] = f"created_at_i>{since}"
+        r = await self._client.get(f"{_BASE}/search", params=params)
+        r.raise_for_status()
+        return r.json().get("hits", [])
+
     async def fetch(
         self,
         *,
@@ -62,6 +83,41 @@ class HackerNewsSource(Source):
         """
         hits = await self._search(tags=tags, limit=limit, since_days=since_days)
         logger.info(f"hn: search returned {len(hits)} hit(s) for tags={tags!r}")
+        async for payload in self._yield_threads(hits, ctx={"tags": tags, "since_days": since_days}):
+            yield payload
+
+    async def search(
+        self,
+        *,
+        query: str,
+        limit: int = 10,
+        since_days: int = 180,
+        tags: str = "story",
+    ) -> AsyncIterator[RawSignalPayload]:
+        """Yield HN threads matching a free-text query (e.g. 'small business tools').
+
+        Uses HN Algolia's /search (relevance-ranked) endpoint, not /search_by_date.
+        Time window defaults to 180 days so domain-specific searches have enough
+        results — most real pain threads are older than the last 30 days.
+        """
+        hits = await self._search_by_query(
+            query=query, tags=tags, limit=limit, since_days=since_days
+        )
+        logger.info(
+            f"hn: search('{query}') returned {len(hits)} hit(s) (tags={tags}, {since_days}d)"
+        )
+        async for payload in self._yield_threads(
+            hits, ctx={"search_query": query, "tags": tags, "since_days": since_days}
+        ):
+            yield payload
+
+    async def _yield_threads(
+        self,
+        hits: list[dict],
+        *,
+        ctx: dict,
+    ) -> AsyncIterator[RawSignalPayload]:
+        """Shared per-hit item-fetch + payload construction for fetch() and search()."""
         for hit in hits:
             object_id = hit.get("objectID")
             if not object_id:
@@ -75,7 +131,7 @@ class HackerNewsSource(Source):
                 source="hackernews",
                 source_id=f"hn_{object_id}",
                 source_url=f"https://news.ycombinator.com/item?id={object_id}",
-                query_context={"tags": tags, "since_days": since_days},
+                query_context=dict(ctx),
                 payload={
                     "post": {
                         "id": thread.get("id"),
@@ -86,7 +142,6 @@ class HackerNewsSource(Source):
                         "created_at": thread.get("created_at"),
                         "url": thread.get("url"),
                     },
-                    # Nested tree; extract flattens it.
                     "children": thread.get("children", []),
                 },
             )
@@ -105,6 +160,23 @@ async def fetch_and_store(
     try:
         return await persist_payloads(
             source.fetch(tags=tags, limit=limit, since_days=since_days)
+        )
+    finally:
+        await source.close()
+
+
+async def fetch_and_store_search(
+    query: str,
+    *,
+    limit: int = 10,
+    since_days: int = 180,
+    tags: str = "story",
+) -> tuple[int, int]:
+    """Search HN by keyword query and insert matching threads into raw_signals."""
+    source = HackerNewsSource()
+    try:
+        return await persist_payloads(
+            source.search(query=query, limit=limit, since_days=since_days, tags=tags)
         )
     finally:
         await source.close()

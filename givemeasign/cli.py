@@ -117,6 +117,33 @@ def fetch_hn(
     logger.info(f"Done. Inserted {inserted} new, skipped {duplicates} duplicate(s).")
 
 
+@app.command("fetch-hn-search")
+def fetch_hn_search(
+    query: str = typer.Argument(
+        ..., help="Free-text search query (e.g. 'small business tools')."
+    ),
+    limit: int = typer.Option(10, "--limit", "-n"),
+    since_days: int = typer.Option(
+        180, "--since-days", "-d", help="Only stories newer than N days."
+    ),
+    tags: str = typer.Option(
+        "story", "--tags", "-t", help="HN Algolia tag filter (default: story)."
+    ),
+) -> None:
+    """Search HN by keyword query — surfaces domain-specific pain threads
+    (teachers, small business, restaurants, healthcare, …) instead of just
+    AI-for-AI-devs Ask HN posts."""
+    from givemeasign.sources.hackernews import fetch_and_store_search
+
+    logger.info(f"Searching HN [{query!r}, tags={tags}, limit={limit}, since={since_days}d]…")
+    inserted, duplicates = asyncio.run(
+        fetch_and_store_search(
+            query=query, limit=limit, since_days=since_days, tags=tags
+        )
+    )
+    logger.info(f"Done. Inserted {inserted} new, skipped {duplicates} duplicate(s).")
+
+
 @app.command("fetch-devto")
 def fetch_devto(
     tag: str = typer.Option("discuss", "--tag", "-t", help="Dev.to tag (discuss, beginners, help, …)."),
@@ -165,6 +192,39 @@ def extract_pains(
     )
 
 
+@app.command("ideate")
+def ideate_cmd(
+    seeds: str = typer.Option(
+        "",
+        "--seeds",
+        help=(
+            "Comma-separated seed themes (empty = use HN_SEARCH_SEEDS env / config default). "
+            "Sonnet generates 1–3 hypothesis candidates per theme."
+        ),
+    ),
+    chunk_size: int = typer.Option(
+        8, "--chunk-size", help="Themes per Sonnet call (8 is a good balance)."
+    ),
+) -> None:
+    """A-stream ideation: generate hypothesis candidates from seed themes via
+    Sonnet — no pain threads required. Lands in the same candidates table
+    (origin='hypothesis') and flows through the normal score + dedup + deck pipeline."""
+    from givemeasign.config import settings
+    from givemeasign.pipeline.ideate import ideate_from_seeds
+
+    raw = seeds or settings.hn_search_seeds
+    theme_list = [t.strip() for t in raw.split(",") if t.strip()]
+    logger.info(f"Ideating from {len(theme_list)} seed theme(s)…")
+    summary = asyncio.run(
+        ideate_from_seeds(theme_list, chunk_size=chunk_size)
+    )
+    logger.info(
+        f"Done. seeds={summary.seeds_in} chunks={summary.chunks_run} "
+        f"ideas={summary.ideas_parsed} inserted={summary.candidates_inserted} "
+        f"cost=${summary.total_cost_usd:.4f}"
+    )
+
+
 @app.command("build-candidates")
 def build_candidates(
     pain_limit: int = typer.Option(
@@ -187,15 +247,45 @@ def build_candidates(
 @app.command("run-pipeline")
 def run_pipeline_cmd(
     no_fetch: bool = typer.Option(False, "--no-fetch", help="Skip the fetch stage."),
-    hn_limit: int = typer.Option(25, "--hn-limit", help="HN stories to fetch."),
-    hn_tags: str = typer.Option("ask_hn,story", "--hn-tags", help="HN Algolia tag filter."),
-    devto_limit: int = typer.Option(25, "--devto-limit", help="Dev.to articles to fetch."),
-    devto_tag: str = typer.Option("discuss", "--devto-tag", help="Dev.to tag filter."),
+    hn_limit: int = typer.Option(10, "--hn-limit", help="Ask HN stories to fetch."),
+    hn_tags: str = typer.Option(
+        "ask_hn,story", "--hn-tags", help="HN Algolia tag filter for the main Ask HN pull."
+    ),
+    hn_show_limit: int = typer.Option(
+        -1,
+        "--hn-show-limit",
+        help="Show HN stories to fetch (-1 = use HN_SHOW_LIMIT env default).",
+    ),
+    hn_seeds: str = typer.Option(
+        "",
+        "--hn-seeds",
+        help="Comma-separated HN search queries (empty = use HN_SEARCH_SEEDS env).",
+    ),
+    devto_tags: str = typer.Option(
+        "",
+        "--devto-tags",
+        help="Comma-separated Dev.to tags (empty = use DEVTO_TAGS env).",
+    ),
     ph_limit: int = typer.Option(25, "--ph-limit", help="Product Hunt launches to fetch (if configured)."),
     extract_limit: int = typer.Option(100, "--extract-limit"),
     synth_pain_limit: int = typer.Option(100, "--synth-pain-limit"),
+    ideate: bool = typer.Option(
+        False,
+        "--ideate",
+        help=(
+            "Also run the A-stream (hypothesis-first ideation from seed themes). "
+            "Adds ~$0.25–$0.50 Sonnet cost per run."
+        ),
+    ),
+    ideate_seeds: str = typer.Option(
+        "",
+        "--ideate-seeds",
+        help="Comma-separated seed themes for --ideate (empty = use HN_SEARCH_SEEDS).",
+    ),
 ) -> None:
-    """End-to-end: fetch (HN + Dev.to + Product Hunt if configured) → extract → synthesize."""
+    """End-to-end: diversified fetch (HN Ask + HN Show + HN search seeds +
+    Dev.to tag rotation + Product Hunt) → extract → synthesize (B-stream).
+    With --ideate, also run A-stream hypothesis ideation from seed themes."""
     from givemeasign.pipeline.run import run_pipeline
 
     logger.info("Running full pipeline…")
@@ -204,11 +294,14 @@ def run_pipeline_cmd(
             fetch=not no_fetch,
             hn_limit=hn_limit,
             hn_tags=hn_tags,
-            devto_limit=devto_limit,
-            devto_tag=devto_tag,
+            hn_show_limit=(None if hn_show_limit < 0 else hn_show_limit),
+            hn_seeds=(hn_seeds or None),
+            devto_tags=(devto_tags or None),
             ph_limit=ph_limit,
             extract_limit=extract_limit,
             synth_pain_limit=synth_pain_limit,
+            ideate=ideate,
+            ideate_seeds=(ideate_seeds or None),
         )
     )
     logger.info(f"Pipeline complete. Summary: {summary.as_dict()}")
@@ -321,6 +414,125 @@ def score_candidates_cmd(
     )
 
 
+@app.command("learn-weights")
+def learn_weights_cmd() -> None:
+    """Retrain per-dimension weights from swipe history (scoring does this
+    automatically, but you can force a manual retrain + see the result)."""
+    from givemeasign.scoring.learner import retrain_and_persist
+
+    result = retrain_and_persist()
+    logger.info(
+        f"Retrained from {result.total_swipes} total swipe(s) "
+        f"({result.pos_count} positive, {result.neg_count} negative)"
+    )
+    if not result.is_learned:
+        logger.info(
+            f"Need ≥5 swipes with both positive and negative examples to learn; "
+            f"weights stay uniform."
+        )
+        return
+    logger.info(f"Confidence: {result.confidence:.2f}")
+    logger.info("Dimension weights (higher = more important to you):")
+    ranked = sorted(result.weights.items(), key=lambda kv: kv[1], reverse=True)
+    for dim, w in ranked:
+        delta = w - 1.0
+        diff = result.diffs.get(dim, 0.0)
+        marker = "↑" if delta > 0.05 else ("↓" if delta < -0.05 else "·")
+        logger.info(
+            f"  {marker} {dim:<15} weight={w:.3f}  (Δ{delta:+.3f}, "
+            f"mean(pos)−mean(neg)={diff:+.3f})"
+        )
+
+
+@app.command("weights")
+def weights_cmd(
+    action: str = typer.Argument("show", help="show | reset"),
+) -> None:
+    """Show currently-persisted learned weights, or reset to uniform."""
+    from givemeasign.scoring.learner import load_current_weights, reset_weights
+    from sqlalchemy import select
+
+    from givemeasign.db.models import BotSettings
+    from givemeasign.db.session import session_scope
+
+    action = action.lower().strip()
+    if action == "reset":
+        reset_weights()
+        logger.info("Weights reset to uniform.")
+        return
+    if action != "show":
+        logger.error(f"unknown action {action!r}; use 'show' or 'reset'")
+        raise typer.Exit(code=2)
+
+    with session_scope() as s:
+        row = s.get(BotSettings, 1)
+        updated_at = row.weights_updated_at if row else None
+        swipe_count = row.weights_swipe_count if row else 0
+    weights = load_current_weights()
+    if not weights:
+        logger.info("Weights: uniform (no learned weights yet; <5 usable swipes).")
+        logger.info(f"Last retrain: {updated_at or 'never'} · swipes used: {swipe_count}")
+        return
+    logger.info(f"Learned weights from {swipe_count} swipes · updated {updated_at}:")
+    ranked = sorted(weights.items(), key=lambda kv: kv[1], reverse=True)
+    for dim, w in ranked:
+        delta = w - 1.0
+        marker = "↑" if delta > 0.05 else ("↓" if delta < -0.05 else "·")
+        logger.info(f"  {marker} {dim:<15} weight={w:.3f}  (Δ{delta:+.3f})")
+
+
+@app.command("recompute-aggregates")
+def recompute_aggregates_cmd(
+    include_gated: bool = typer.Option(
+        False, "--include-gated", help="Also recompute for gated_out candidates."
+    ),
+) -> None:
+    """Reapply current weights to already-scored candidates without calling the LLM.
+
+    Fast: pure math on Score rows. Useful after `learn-weights` to see how the
+    ranking shifts without burning tokens on a full --force rescore."""
+    from sqlalchemy import select, update
+
+    from givemeasign.db.models import Candidate, Score
+    from givemeasign.db.session import session_scope
+    from givemeasign.llm.prompts.score_candidate import SCORER_VERSION
+    from givemeasign.scoring.aggregate import multiplicative_aggregate
+    from givemeasign.scoring.learner import load_current_weights
+
+    weights = load_current_weights()
+    logger.info(f"Recomputing aggregates with {'learned' if weights else 'uniform'} weights…")
+
+    statuses = ["scored"]
+    if include_gated:
+        statuses.append("gated_out")
+
+    updated = 0
+    with session_scope() as s:
+        cand_ids = list(
+            s.execute(
+                select(Candidate.id).where(Candidate.status.in_(statuses))
+            ).scalars()
+        )
+        for cid in cand_ids:
+            dim_rows = s.execute(
+                select(Score.dimension, Score.value)
+                .where(Score.candidate_id == cid)
+                .where(Score.scorer_version == SCORER_VERSION)
+            ).all()
+            if not dim_rows:
+                continue
+            dim_scores = {d: float(v) for d, v in dim_rows}
+            new_agg = multiplicative_aggregate(dim_scores, weights=weights)
+            s.execute(
+                update(Candidate)
+                .where(Candidate.id == cid)
+                .values(aggregate_score=new_agg)
+            )
+            updated += 1
+
+    logger.info(f"Updated aggregate_score on {updated} candidate(s).")
+
+
 @app.command("top-candidates")
 def top_candidates(
     limit: int = typer.Option(10, "--limit", "-n", help="Max rows to show."),
@@ -408,8 +620,10 @@ def list_candidates(
             typer.echo("(no candidates)")
             return
         for cand, pain_count in rows:
+            origin = getattr(cand, "origin", "pains") or "pains"
             typer.echo(
-                f"{cand.confidence:.2f}  [{pain_count or 0} pains]  {cand.concept}"
+                f"{cand.confidence:.2f}  [{pain_count or 0} pains · {origin}]  "
+                f"{cand.concept}"
             )
             if cand.target_user:
                 typer.echo(f"       user:    {cand.target_user}")

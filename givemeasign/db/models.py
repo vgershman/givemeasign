@@ -113,6 +113,9 @@ class Candidate(Base, UUIDPrimaryKey, TimestampMixin):
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="synthesized")
     synthesizer_version: Mapped[str] = mapped_column(String(30), nullable=False)
     embedding: Mapped[list[float] | None] = mapped_column(Vector(1536), nullable=True)
+    # B-stream ('pains') = clustered from pain_signals; A-stream ('hypothesis')
+    # = ideated directly from a seed theme by pipeline/ideate.py.
+    origin: Mapped[str] = mapped_column(String(20), nullable=False, default="pains", index=True)
 
     # Scoring outcomes (added in M4).
     aggregate_score: Mapped[float | None] = mapped_column(Float, nullable=True, index=True)
@@ -250,6 +253,15 @@ class BotSettings(Base):
     # Telegram output language. DB content stays English; this toggles lazy
     # translation of cards + research packs at delivery time.
     display_locale: Mapped[str] = mapped_column(String(5), nullable=False, default="en")
+    # M7: learned per-dimension weights. Empty dict = uniform. Retrained
+    # automatically before each score-candidates run.
+    dimension_weights: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    weights_updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    weights_swipe_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

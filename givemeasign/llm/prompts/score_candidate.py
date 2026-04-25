@@ -97,6 +97,7 @@ def render_user_prompt(
     avg_strength: float,
     demand_baseline: float,
     trend_slopes: dict[str, float] | None = None,
+    is_hypothesis: bool = False,
 ) -> str:
     """Render the evidence pack as the user message."""
     angles_block = (
@@ -127,12 +128,23 @@ def render_user_prompt(
             "Google Trends: (unavailable — score competition from general knowledge of the space)"
         )
 
-    stats_block = (
-        f"PAIN STATS:\n"
-        f"  pain_count:      {pain_count}\n"
-        f"  avg_strength:    {avg_strength:.2f}\n"
-        f"  demand_baseline: {demand_baseline:.2f}   ← USE THIS as starting point for DEMAND\n"
-    )
+    if is_hypothesis:
+        stats_block = (
+            f"PAIN STATS:\n"
+            f"  pain_count:      0  (hypothesis candidate — ideated from a seed theme,\n"
+            f"                       not clustered from forum threads)\n"
+            f"  demand_baseline: {demand_baseline:.2f}   ← synthetic/neutral; IGNORE and\n"
+            f"                       base DEMAND entirely on your knowledge of the market\n"
+            f"                       for this concept (is anyone searching for / paying for\n"
+            f"                       tools in this space? how big is the user universe?)\n"
+        )
+    else:
+        stats_block = (
+            f"PAIN STATS:\n"
+            f"  pain_count:      {pain_count}\n"
+            f"  avg_strength:    {avg_strength:.2f}\n"
+            f"  demand_baseline: {demand_baseline:.2f}   ← USE THIS as starting point for DEMAND\n"
+        )
 
     return (
         f"CANDIDATE:\n"

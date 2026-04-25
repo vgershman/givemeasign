@@ -45,8 +45,17 @@ class EvidenceStats:
     demand_baseline: float
 
 
-def compute_stats(pains: list[PainSignal]) -> EvidenceStats:
+def compute_stats(
+    pains: list[PainSignal], *, origin: str = "pains"
+) -> EvidenceStats:
     if not pains:
+        # Hypothesis candidates (A-stream) have no linked pains by design —
+        # demand should START neutral (0.5), letting the LLM adjust based on
+        # its market knowledge rather than gate the candidate out on "no_demand".
+        # Pain-stream candidates with zero pains are a pathological case and
+        # keep the old 0.0 behavior so they correctly gate out.
+        if origin == "hypothesis":
+            return EvidenceStats(0, 0.0, 0.0, 0.5)
         return EvidenceStats(0, 0.0, 0.0, 0.0)
     strengths = [p.strength for p in pains]
     pain_count = len(pains)
@@ -85,7 +94,11 @@ def build_evidence(s: Session, candidate_id: UUID) -> Evidence | None:
         .order_by(PainSignal.strength.desc())
     )
     pains = list(s.execute(pain_stmt).scalars().all())
-    return Evidence(candidate=c, pains=pains, stats=compute_stats(pains))
+    return Evidence(
+        candidate=c,
+        pains=pains,
+        stats=compute_stats(pains, origin=(c.origin or "pains")),
+    )
 
 
 def pains_for_prompt(pains: list[PainSignal], *, cap: int = 15) -> list[dict]:

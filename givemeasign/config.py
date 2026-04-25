@@ -48,6 +48,54 @@ class Settings(BaseSettings):
     product_hunt_token: SecretStr = SecretStr("")
     ahrefs_api_key: SecretStr = SecretStr("")
 
+    # --- Source diversification (M3b) ---
+    # Free-text queries the HN search fetch rotates through to surface pains
+    # outside the AI-for-AI-devs default bias. Two flavors of seed:
+    #   - DOMAIN seeds: "who's suffering" (personas + industries)
+    #   - MECHANISM seeds: "what kinds of products get discussed"
+    #     (image/voice/OCR/scheduling/messenger bots, etc.)
+    # Comma-separated. Adjust via HN_SEARCH_SEEDS env var.
+    hn_search_seeds: str = (
+        # Domain-shaped
+        "small business tools,"
+        "teachers struggle,"
+        "restaurant operations,"
+        "freelancer problems,"
+        "parents need,"
+        "healthcare workflow,"
+        "accountant tedious,"
+        "real estate paperwork,"
+        # Mechanism-shaped: image / vision
+        "image processing tool,"
+        "document scanning ocr,"
+        "photo organization app,"
+        "screenshot automation,"
+        # Mechanism-shaped: voice / audio
+        "voice to text,"
+        "voice input productivity,"
+        "meeting transcription,"
+        "podcast editing workflow,"
+        # Mechanism-shaped: AI assistants + messenger bots
+        "personal ai assistant,"
+        "ai scheduling bot,"
+        "telegram bot productivity,"
+        "whatsapp bot automation,"
+        # Mechanism-shaped: common daily workflows
+        "calendar scheduling chaos,"
+        "meal planning app,"
+        "invoice automation,"
+        "video editing workflow"
+    )
+    hn_search_per_seed: int = 5
+    hn_show_limit: int = 10
+
+    # Dev.to tags the pipeline rotates through per run. Broader than just
+    # `discuss` — captures career, productivity, writing, help etc.
+    devto_tags: str = (
+        "discuss,productivity,career,writing,nocode,beginners,help,freelance,showdev"
+    )
+    devto_per_tag: int = 4
+
     # --- Telegram ---
     telegram_bot_token: SecretStr = SecretStr("")
     telegram_user_id: int = 0
