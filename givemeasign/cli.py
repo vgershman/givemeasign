@@ -30,6 +30,7 @@ _PIPELINE_COMMANDS = {
     "send-deck",
     "bot",
     "generate-research",
+    "mark-delivered",
 }
 
 
@@ -242,6 +243,58 @@ def build_candidates(
         f"linked={summary.linked_pains} orphan={summary.orphan_pains} "
         f"cost=${summary.total_cost_usd:.4f}"
     )
+
+
+@app.command("mark-delivered")
+def mark_delivered_cmd(
+    top_n: int = typer.Option(
+        30,
+        "--top-n",
+        help="Stamp this many top-scored candidates as already-delivered.",
+    ),
+    all_scored: bool = typer.Option(
+        False, "--all", help="Stamp ALL scored candidates instead of just the top-N."
+    ),
+) -> None:
+    """One-shot recovery: mark already-seen candidates as delivered so they
+    won't reappear in tomorrow's deck. Use after upgrading to 0013 if your
+    user has been receiving the same top-10 day after day.
+    """
+    from sqlalchemy import select, update
+
+    from givemeasign.db.models import Candidate
+    from givemeasign.db.session import session_scope
+
+    with session_scope() as s:
+        if all_scored:
+            ids = list(
+                s.execute(
+                    select(Candidate.id).where(Candidate.status == "scored")
+                ).scalars()
+            )
+        else:
+            ids = list(
+                s.execute(
+                    select(Candidate.id)
+                    .where(Candidate.status == "scored")
+                    .order_by(Candidate.aggregate_score.desc().nulls_last())
+                    .limit(top_n)
+                ).scalars()
+            )
+        if not ids:
+            typer.echo("No scored candidates to mark.")
+            return
+        # Snapshot the score-at-delivery so the +10% escape still works for
+        # candidates that might re-score higher later.
+        s.execute(
+            update(Candidate)
+            .where(Candidate.id.in_(ids))
+            .values(
+                last_delivered_at=datetime.now(timezone.utc),
+                last_delivered_score=Candidate.aggregate_score,
+            )
+        )
+    logger.info(f"Marked {len(ids)} candidate(s) as delivered.")
 
 
 @app.command("run-pipeline")

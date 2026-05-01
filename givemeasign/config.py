@@ -100,6 +100,15 @@ class Settings(BaseSettings):
     telegram_bot_token: SecretStr = SecretStr("")
     telegram_user_id: int = 0
 
+    # --- Daily auto-pipeline (runs before deck delivery) ---
+    # 0 = disabled (manual `givemeasign run-pipeline` only).
+    # >0 = run pipeline + score this many minutes before the configured deck
+    # time so the deck reflects today's ingest.
+    pipeline_lead_minutes: int = 30
+    # Cap on how many candidates to score per auto-run. Stays below the per-day
+    # token budget without bespoke math.
+    auto_score_limit: int = 30
+
     # --- Budgets (USD) ---
     daily_budget_usd: float = 5.00
     monthly_budget_usd: float = 150.00

@@ -127,6 +127,15 @@ class Candidate(Base, UUIDPrimaryKey, TimestampMixin):
     )
     scored_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
+    # 0013: anti-repeat for the daily deck. last_delivered_at is set the first
+    # time a candidate appears in a delivered deck. last_delivered_score snapshots
+    # the aggregate_score at delivery so we can re-deliver only when the score
+    # has improved materially (≥10%) on a later scoring pass.
+    last_delivered_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_delivered_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+
     # Lazy-populated translations keyed by locale code (e.g. {"ru": {...}}).
     # English stays in concept/target_user/value_prop/angles; non-English
     # rendering uses translations[locale].

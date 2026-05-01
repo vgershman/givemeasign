@@ -1,17 +1,28 @@
-"""Pick today's deck of candidates and send them as Telegram cards."""
+"""Pick today's deck of candidates and send them as Telegram cards.
+
+Anti-repeat (0013): once a candidate is included in a delivered deck, its
+`last_delivered_at` and `last_delivered_score` are stamped. Future deck
+selections hard-exclude already-delivered candidates UNLESS their current
+`aggregate_score` has improved by `REPEAT_SCORE_IMPROVE_RATIO` (default 1.10
+= +10%) on a later scoring pass — that's the single escape hatch.
+
+Pre-0013 the deck only filtered swiped candidates, so anything the user
+ignored re-appeared every day. With a static pool + frozen scores, the same
+top-10 came back forever.
+"""
 
 from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
-from sqlalchemy import select
+from sqlalchemy import or_, select, update
 from sqlalchemy.orm import Session
 
 from givemeasign.config import settings
@@ -24,6 +35,10 @@ from givemeasign.llm.router import LLMRouter
 from givemeasign.observability.logging import logger
 from givemeasign.telegram.cards import format_card_html, make_keyboard
 from givemeasign.telegram.settings import get_display_locale
+
+# How much aggregate_score must improve (multiplicatively) over the score at
+# last delivery before we'll re-deliver. 1.10 = score must climb by ≥10%.
+REPEAT_SCORE_IMPROVE_RATIO = 1.10
 
 
 @dataclass
@@ -41,7 +56,14 @@ def _today_in_tz() -> date:
 
 
 def _fetch_deck_candidates(s: Session, user_id: int, limit: int) -> list[Candidate]:
-    """Top-N scored candidates not yet swiped by this user."""
+    """Top-N scored candidates eligible for delivery to this user.
+
+    Eligibility rules:
+      - status == 'scored'
+      - not previously swiped by this user
+      - either never delivered, OR aggregate_score has improved by
+        ≥REPEAT_SCORE_IMPROVE_RATIO since the last delivery (re-score escape)
+    """
     swiped = (
         select(SwipeVerdict.candidate_id)
         .where(SwipeVerdict.user_id == user_id)
@@ -51,10 +73,35 @@ def _fetch_deck_candidates(s: Session, user_id: int, limit: int) -> list[Candida
         select(Candidate)
         .where(Candidate.status == "scored")
         .where(Candidate.id.not_in(swiped))
+        .where(
+            or_(
+                Candidate.last_delivered_at.is_(None),
+                Candidate.aggregate_score
+                > Candidate.last_delivered_score * REPEAT_SCORE_IMPROVE_RATIO,
+            )
+        )
         .order_by(Candidate.aggregate_score.desc().nulls_last())
         .limit(limit)
     )
     return list(s.execute(stmt).scalars().all())
+
+
+def _mark_delivered(s: Session, candidate_ids: list[UUID]) -> None:
+    """Stamp last_delivered_at + last_delivered_score on the just-shipped batch.
+
+    Snapshot the candidate's CURRENT aggregate_score so the "improved by 10%"
+    check on the next deck has a stable baseline.
+    """
+    if not candidate_ids:
+        return
+    s.execute(
+        update(Candidate)
+        .where(Candidate.id.in_(candidate_ids))
+        .values(
+            last_delivered_at=datetime.now(timezone.utc),
+            last_delivered_score=Candidate.aggregate_score,
+        )
+    )
 
 
 def _fetch_scores(s: Session, candidate_id: UUID) -> list[Score]:
@@ -184,6 +231,7 @@ async def send_deck(
             logger.warning(f"send_deck: header send failed: {e}")
 
         sent = 0
+        delivered_ids: list[UUID] = []
         for card in cards:
             try:
                 await bot.send_message(
@@ -194,9 +242,16 @@ async def send_deck(
                     disable_web_page_preview=True,
                 )
                 sent += 1
+                delivered_ids.append(UUID(card["candidate_id"]))
             except TelegramAPIError as e:
                 logger.error(f"send_deck: failed to send card {card['candidate_id']}: {e}")
             await asyncio.sleep(inter_message_delay)
+        # Stamp delivery so these candidates won't reappear in tomorrow's deck
+        # unless their aggregate_score improves by ≥10% on a re-score.
+        if delivered_ids:
+            with session_scope() as s:
+                _mark_delivered(s, delivered_ids)
+            logger.info(f"send_deck: marked {len(delivered_ids)} candidate(s) as delivered")
         return DeckResult(sent=sent, no_new=False)
     finally:
         if own_bot:

@@ -282,25 +282,94 @@ def _seconds_until(hour: int, minute: int, tz_name: str) -> float:
     return (target - now).total_seconds()
 
 
+async def _run_auto_pipeline() -> None:
+    """Run the daily fetch+extract+synth pipeline, then score new candidates.
+
+    Best-effort: any exception is logged and swallowed so a flaky source can't
+    block the deck delivery 30 min later. Cost-bounded by `auto_score_limit`.
+    """
+    # Lazy imports — these touch httpx + LLMs and aren't needed for normal
+    # bot operation.
+    from givemeasign.pipeline.run import run_pipeline
+    from givemeasign.scoring.runner import score_candidates_batch
+
+    logger.info("auto-pipeline: fetch+extract+synth starting")
+    try:
+        summary = await run_pipeline()
+        logger.info(f"auto-pipeline: pipeline summary={summary.as_dict()}")
+    except Exception as e:  # noqa: BLE001
+        logger.exception(f"auto-pipeline: pipeline failed: {e}")
+        return
+
+    logger.info(
+        f"auto-pipeline: scoring up to {settings.auto_score_limit} new candidate(s)"
+    )
+    try:
+        scoring = await score_candidates_batch(limit=settings.auto_score_limit)
+        logger.info(
+            f"auto-pipeline: scored={scoring.scored} gated={scoring.gated} "
+            f"deduped={scoring.deduplicated} cost=${scoring.total_cost_usd:.4f}"
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.exception(f"auto-pipeline: scoring failed: {e}")
+
+
 async def _daily_deck_loop(bot: Bot) -> None:
-    """Sleep until the configured hour:minute, send deck, repeat."""
+    """Sleep until the deck time, optionally run pipeline+score N min before, send deck.
+
+    `pipeline_lead_minutes` env controls the lead window. 0 = disabled (deck
+    only, no auto-pipeline — handy for dev). The lead-time window is computed
+    relative to the configured deck hour:minute so flipping deck time in
+    bot_settings just shifts both stages forward.
+    """
     logger.info("daily-deck scheduler started")
     while True:
         try:
             hour, minute, enabled = get_daily_deck_schedule()
-            wait_s = _seconds_until(hour, minute, settings.timezone)
-            logger.info(
-                f"daily-deck: next fire in {wait_s/3600:.2f}h at "
-                f"{hour:02d}:{minute:02d} {settings.timezone} "
-                f"(enabled={enabled})"
-            )
-            await asyncio.sleep(wait_s)
-            # Re-read settings in case they changed during the sleep.
+            lead_min = max(0, settings.pipeline_lead_minutes)
+            deck_wait_s = _seconds_until(hour, minute, settings.timezone)
+
+            if lead_min > 0:
+                # Sleep until pipeline_time = deck_time - lead_min, run pipeline,
+                # then sleep the remaining lead_min before delivery.
+                pipeline_wait_s = deck_wait_s - lead_min * 60
+                if pipeline_wait_s < 0:
+                    # Deck fires within `lead_min` — too late to run a fresh
+                    # pipeline this cycle; send what we have.
+                    logger.info(
+                        f"daily-deck: deck fires in {deck_wait_s/60:.1f}m, "
+                        f"skipping auto-pipeline this cycle"
+                    )
+                    pipeline_wait_s = None
+                else:
+                    logger.info(
+                        f"daily-deck: auto-pipeline in {pipeline_wait_s/3600:.2f}h, "
+                        f"deck in {deck_wait_s/3600:.2f}h "
+                        f"({hour:02d}:{minute:02d} {settings.timezone}, enabled={enabled})"
+                    )
+                if pipeline_wait_s is not None:
+                    await asyncio.sleep(pipeline_wait_s)
+                    # Re-read enabled — if the deck got disabled while we slept,
+                    # skip the pipeline cost too.
+                    _, _, enabled = get_daily_deck_schedule()
+                    if enabled:
+                        await _run_auto_pipeline()
+                    else:
+                        logger.info("auto-pipeline: skipped (deck disabled)")
+                    # Sleep the remaining minutes until deck time.
+                    deck_wait_s = _seconds_until(hour, minute, settings.timezone)
+            else:
+                logger.info(
+                    f"daily-deck: next fire in {deck_wait_s/3600:.2f}h at "
+                    f"{hour:02d}:{minute:02d} {settings.timezone} "
+                    f"(enabled={enabled}, auto-pipeline=off)"
+                )
+
+            await asyncio.sleep(deck_wait_s)
             _, _, enabled = get_daily_deck_schedule()
             if not enabled:
                 logger.info("daily-deck: skipped (disabled in bot_settings)")
-                # Avoid tight loop on the same minute.
-                await asyncio.sleep(61)
+                await asyncio.sleep(61)  # avoid tight loop on the same minute
                 continue
             try:
                 result = await send_deck(bot=bot)
